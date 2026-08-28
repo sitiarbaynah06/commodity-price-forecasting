@@ -1,0 +1,879 @@
+---
+title: "Hybrid ARIMA GARCH"
+author: "Siti Arbaynah"
+date: "2026-08-27"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# ============================================================
+# 0. LOAD PACKAGE
+# ============================================================
+```{r}
+library(readxl)
+library(forecast)
+library(tseries)
+library(zoo)
+library(dplyr)
+library(tidyr)
+library(FinTS)
+library(rugarch)
+library(writexl)
+library(openxlsx)   # dipakai untuk menulis sheet dengan kontrol baris (selaras gaya Excel LSTM)
+```
+
+# ============================================================
+# 1. LOAD & PERSIAPAN DATA
+# ============================================================
+```{r}
+ayam      <- read_excel("D:/SEMESTER 8/DATA/ayam_harian.xlsx")
+beras     <- read_excel("D:/SEMESTER 8/DATA/beraspremium_harian.xlsx")
+bawangmerah <- read_excel("D:/SEMESTER 8/DATA/bawangmerah_harian (1).xlsx")
+
+beras$Tgl_Masuk     <- as.Date(beras$Tgl_Masuk)
+ayam$Tgl_Masuk      <- as.Date(ayam$Tgl_Masuk)
+bawangmerah$Tgl_Masuk <- as.Date(bawangmerah$Tgl_Masuk)
+
+lengkapi <- function(df) {
+  df %>%
+    complete(Tgl_Masuk = seq(min(Tgl_Masuk), max(Tgl_Masuk), by = "day"))
+}
+
+beras     <- lengkapi(beras)
+ayam      <- lengkapi(ayam)
+bawangmerah <- lengkapi(bawangmerah)
+
+imputasi <- function(x) {
+  x <- na.approx(x, na.rm = FALSE)
+  x <- na.locf(x, na.rm = FALSE)
+  x <- na.locf(x, fromLast = TRUE, na.rm = FALSE)
+  return(x)
+}
+
+beras$harga_rata     <- imputasi(beras$harga_rata)
+ayam$harga_rata      <- imputasi(ayam$harga_rata)
+bawangmerah$harga_rata <- imputasi(bawangmerah$harga_rata)
+
+cat("Missing setelah imputasi:\n")
+cat("  Beras    :", sum(is.na(beras$harga_rata)),     "\n")
+cat("  Ayam     :", sum(is.na(ayam$harga_rata)),      "\n")
+cat("  bawang    :", sum(is.na(bawangmerah$harga_rata)), "\n")
+
+OUTPUT_DIR <- "D:/SEMESTER 8/OUTPUT"
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+HORIZONS <- c("1 Hari" = 1, "7 Hari" = 7, "1 Bulan" = 30, "3 Bulan" = 90)
+N_VAL_DAYS <- 90   # window validasi tetap 90 hari supaya horizon 3 bulan selalu bisa dievaluasi penuh
+```
+
+```{r}
+# ============================================================
+# 2. UJI ADF & PLOT ACF/PACF UNTUK SETIAP KOMODITAS
+# ============================================================
+library(tseries)   # untuk adf.test
+library(forecast)  # untuk Acf/Pacf (ggplot-friendly, opsional pakai base juga bisa)
+
+# Kumpulkan data ke dalam satu list supaya bisa di-loop
+daftar_komoditas <- list(
+  Beras       = beras,
+  Ayam        = ayam,
+  BawangMerah = bawangmerah
+)
+
+# Data frame kosong untuk menampung ringkasan hasil uji ADF
+hasil_adf <- data.frame(
+  Komoditas = character(),
+  Nilai_ADF = numeric(),
+  Lag_Order = numeric(),
+  Nilai_p   = numeric(),
+  Stasioner = character(),
+  stringsAsFactors = FALSE
+)
+
+for (nama in names(daftar_komoditas)) {
+
+  df   <- daftar_komoditas[[nama]]
+  x    <- df$harga_rata
+
+  # ---------------------------------------------------
+  # (a) Uji ADF
+  # ---------------------------------------------------
+  uji <- adf.test(x, alternative = "stationary")
+
+  hasil_adf <- rbind(
+    hasil_adf,
+    data.frame(
+      Komoditas = nama,
+      Nilai_ADF = round(uji$statistic, 4),
+      Lag_Order = uji$parameter,
+      Nilai_p   = round(uji$p.value, 4),
+      Stasioner = ifelse(uji$p.value < 0.05, "Ya", "Tidak")
+    )
+  )
+
+  # Simpan hasil uji ADF individu ke file teks
+  sink(file.path(OUTPUT_DIR, paste0("ADF_", nama, ".txt")))
+  print(uji)
+  sink()
+
+  # ---------------------------------------------------
+  # (b) Plot ACF dan PACF (data level / sebelum differencing)
+  # ---------------------------------------------------
+  png(file.path(OUTPUT_DIR, paste0("ACF_PACF_", nama, ".png")),
+      width = 1000, height = 500, res = 120)
+  par(mfrow = c(1, 2))
+  acf(x,  main = paste("ACF -", nama), na.action = na.pass)
+  pacf(x, main = paste("PACF -", nama), na.action = na.pass)
+  dev.off()
+
+  # ---------------------------------------------------
+  # (c) (Opsional) Jika belum stasioner, lakukan differencing ordo 1
+  #     dan simpan juga ACF/PACF hasil differencing
+  # ---------------------------------------------------
+  if (uji$p.value >= 0.05) {
+    x_diff <- diff(x, differences = 1)
+
+    uji_diff <- adf.test(x_diff, alternative = "stationary")
+    sink(file.path(OUTPUT_DIR, paste0("ADF_", nama, "_diff1.txt")))
+    print(uji_diff)
+    sink()
+
+    png(file.path(OUTPUT_DIR, paste0("ACF_PACF_", nama, "_diff1.png")),
+        width = 1000, height = 500, res = 120)
+    par(mfrow = c(1, 2))
+    acf(x_diff,  main = paste("ACF -", nama, "(diff 1)"), na.action = na.pass)
+    pacf(x_diff, main = paste("PACF -", nama, "(diff 1)"), na.action = na.pass)
+    dev.off()
+  }
+}
+
+# ---------------------------------------------------
+# (d) Simpan ringkasan seluruh hasil uji ADF ke CSV
+# ---------------------------------------------------
+write.csv(hasil_adf,
+          file.path(OUTPUT_DIR, "Ringkasan_Uji_ADF.csv"),
+          row.names = FALSE)
+
+print(hasil_adf)
+```
+
+# ============================================================
+# 2. EXPANDING WINDOW CV SPLITS UNTUK TUNING ORDO (DATA LATIH SAJA)
+# ============================================================
+```{r}
+get_cv_splits <- function(df) {
+  list(
+    list(train = df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= "2023-06-30"),
+         val   = df %>% filter(Tgl_Masuk >= "2023-07-01" & Tgl_Masuk <= "2023-09-30")),
+    list(train = df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= "2023-09-30"),
+         val   = df %>% filter(Tgl_Masuk >= "2023-10-01" & Tgl_Masuk <= "2023-12-31")),
+    list(train = df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= "2023-12-31"),
+         val   = df %>% filter(Tgl_Masuk >= "2024-01-01" & Tgl_Masuk <= "2024-03-31")),
+    list(train = df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= "2024-03-31"),
+         val   = df %>% filter(Tgl_Masuk >= "2024-04-01" & Tgl_Masuk <= "2024-06-30")),
+    list(train = df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= "2024-06-30"),
+         val   = df %>% filter(Tgl_Masuk >= "2024-07-01" & Tgl_Masuk <= "2024-09-30")),
+    list(train = df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= "2024-09-30"),
+         val   = df %>% filter(Tgl_Masuk >= "2024-10-01" & Tgl_Masuk <= "2024-12-31"))
+  )
+}
+```
+
+# ============================================================
+# 3. EXPANDING WINDOW SPLITS UNTUK EVALUASI KONSISTENSI
+# ============================================================
+```{r}
+get_eval_splits <- function(df, n_val_days = N_VAL_DAYS) {
+
+  val_starts <- seq(as.Date("2025-01-01"), as.Date("2025-12-01"), by = "month")
+
+  splits <- list()
+  for (val_start in val_starts) {
+    val_start  <- as.Date(val_start, origin = "1970-01-01")
+    train_end  <- val_start - 1
+    val_end    <- val_start + (n_val_days - 1)
+
+    train_fold <- df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= train_end)
+    val_fold   <- df %>% filter(Tgl_Masuk >= val_start & Tgl_Masuk <= val_end)
+
+    splits[[length(splits) + 1]] <- list(
+      train = train_fold,
+      val   = val_fold,
+      label = paste0("Val: ", format(val_start, "%b %Y"), " - ",
+                     format(val_end, "%d %b %Y"))
+    )
+  }
+
+  # Buang fold yang validasinya tidak cukup panjang untuk horizon terlama (90 hari)
+  splits <- Filter(function(s) nrow(s$val) >= n_val_days, splits)
+  return(splits)
+}
+```
+
+# ============================================================
+# 4. FUNGSI METRIK
+# ============================================================
+```{r}
+hitung_rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2))
+hitung_mape <- function(actual, predicted) mean(abs((actual - predicted) / actual)) * 100
+hitung_mae  <- function(actual, predicted) mean(abs(actual - predicted))
+```
+
+# ============================================================
+# 5. FUNGSI PILIH MODEL GARCH TERBAIK (untuk penentuan ordo)
+# ============================================================
+```{r}
+pilih_garch <- function(residual) {
+  hasil <- data.frame()
+  for (p in 1:2) {
+    for (q in 0:2) {
+      spec <- tryCatch({
+        ugarchspec(
+          variance.model = list(model = "sGARCH", garchOrder = c(p, q)),
+          mean.model     = list(armaOrder = c(0, 0), include.mean = FALSE),
+          distribution.model = "norm"
+        )
+      }, error = function(e) NULL)
+
+      if (!is.null(spec)) {
+        fit <- tryCatch(
+          ugarchfit(spec = spec, data = residual, solver = "hybrid"),
+          error = function(e) NULL
+        )
+        if (!is.null(fit) && convergence(fit) == 0) {
+          ic <- tryCatch(infocriteria(fit), error = function(e) NULL)
+          if (!is.null(ic) && length(ic) >= 1) {
+            hasil <- rbind(hasil, data.frame(
+              Model = paste0("GARCH(", p, ",", q, ")"),
+              p = p, q = q, AIC = ic[1]
+            ))
+          }
+        }
+      }
+    }
+  }
+  hasil <- hasil[order(hasil$AIC), ]
+  return(hasil)
+}
+```
+
+# ============================================================
+# 6. TENTUKAN ORDO ARIMA & GARCH (SEKALI, DARI DATA LATIH 2023-2024)
+# ============================================================
+```{r}
+tentukan_ordo <- function(df, nama_komoditas) {
+
+  cat("\n", strrep("=", 60), "\n")
+  cat("  PENENTUAN ORDO ARIMA & GARCH -", nama_komoditas, "\n")
+  cat("  (berdasarkan data latih Jan 2023 - Des 2024 saja)\n")
+  cat(strrep("=", 60), "\n")
+
+  train_full <- df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= "2024-12-31")
+  train_ts   <- ts(train_full$harga_rata)
+
+  arima_fit <- tryCatch(
+    auto.arima(train_ts, seasonal = FALSE, stepwise = FALSE, approximation = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(arima_fit)) stop("auto.arima gagal menentukan ordo untuk ", nama_komoditas)
+
+  ordo_arima <- arimaorder(arima_fit)
+  cat("  Ordo ARIMA terpilih:", paste0("(", paste(ordo_arima, collapse=","), ")"), "\n")
+
+  res_arima <- residuals(arima_fit)
+  arch_test <- tryCatch(ArchTest(res_arima, lags = 7), error = function(e) NULL)
+  ada_arch  <- if (!is.null(arch_test)) arch_test$p.value < 0.05 else FALSE
+
+  if (ada_arch) {
+    gt <- tryCatch(pilih_garch(res_arima), error = function(e) NULL)
+    ordo_garch <- if (!is.null(gt) && nrow(gt) > 0) c(gt$p[1], gt$q[1]) else c(1, 1)
+  } else {
+    ordo_garch <- c(1, 1)
+  }
+  cat("  Ordo GARCH terpilih:", paste0("(", paste(ordo_garch, collapse=","), ")"), "\n")
+
+  list(ordo_arima = ordo_arima, ordo_garch = ordo_garch)
+}
+```
+
+
+
+# ============================================================
+# 7. EVALUASI KONSISTENSI -- EXPANDING WINDOW KE DATA UJI (2025)
+# ============================================================
+```{r}
+evaluasi_konsistensi <- function(df, ordo_arima, ordo_garch, komoditas = "Komoditas") {
+
+  cat("\n", strrep("=", 65), "\n")
+  cat("  EVALUASI KONSISTENSI ARIMA-GARCH -", toupper(komoditas), "\n")
+  cat("  Expanding Window -> Data Uji (2025), Validasi 90 hari/fold\n")
+  cat(strrep("=", 65), "\n")
+
+  splits <- get_eval_splits(df)
+
+  metrics <- list()
+  for (h in names(HORIZONS)) {
+    metrics[[h]] <- data.frame(Fold = integer(), MAPE = numeric(),
+                               RMSE = numeric(), MAE = numeric())
+  }
+
+  fold_results <- list()
+
+  for (fold_idx in seq_along(splits)) {
+
+    s          <- splits[[fold_idx]]
+    train_fold <- s$train
+    val_fold   <- s$val
+
+    cat("\n  Fold", fold_idx, "/", length(splits), "\n")
+    cat("  Train :", format(min(train_fold$Tgl_Masuk), "%d %b %Y"),
+        "s.d.", format(max(train_fold$Tgl_Masuk), "%d %b %Y"),
+        "(", nrow(train_fold), "obs)\n")
+    cat("  Val   :", format(min(val_fold$Tgl_Masuk), "%d %b %Y"),
+        "s.d.", format(max(val_fold$Tgl_Masuk), "%d %b %Y"),
+        "(", nrow(val_fold), "obs)\n")
+
+
+d <- ordo_arima[2]
+train_level <- train_fold$harga_rata
+train_ts <- ts(diff(train_level, differences = d))   # data sudah di-diff
+
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = ordo_garch),
+  mean.model     = list(armaOrder = c(ordo_arima[1], ordo_arima[3]),
+                        include.mean = FALSE),   # biasanya FALSE setelah diff
+  distribution.model = "norm"
+)
+
+hybrid_fit <- ugarchfit(spec = spec, data = train_ts, solver = "hybrid")
+fc <- ugarchforecast(hybrid_fit, n.ahead = nrow(val_fold))
+pred_diff <- as.numeric(fitted(fc))
+
+# Integrasi balik ke skala level (undifferencing, d=1):
+last_val <- tail(train_level, 1)
+pred_inv <- last_val + cumsum(pred_diff)   # rekonstruksi ke skala harga asli
+
+    
+    y_inv    <- val_fold$harga_rata
+    n        <- length(y_inv)
+
+    # --- Simpan struktur fold_results SEJAJAR dengan LSTM ---
+    fold_results[[length(fold_results) + 1]] <- list(
+      fold         = fold_idx,
+      train_fold   = train_fold,      # data.frame, dipakai untuk plot
+      val_fold     = val_fold,        # data.frame, dipakai untuk plot
+      train_actual = train_fold$harga_rata,
+      y_actual     = y_inv,
+      y_pred       = pred_inv,
+      pred_dates   = val_fold$Tgl_Masuk[1:n]
+    )
+
+    cat("\n  ", sprintf("%-12s %10s %12s %12s", "Horizon","MAPE (%)","RMSE","MAE"), "\n")
+    cat("  ", strrep("-", 48), "\n")
+
+    for (h_name in names(HORIZONS)) {
+      h_len <- HORIZONS[[h_name]]
+      n_h   <- min(h_len, n)
+      if (n_h > 0) {
+        yt <- y_inv[1:n_h]
+        yp <- pred_inv[1:n_h]
+        m  <- hitung_mape(yt, yp)
+        r  <- hitung_rmse(yt, yp)
+        a  <- hitung_mae(yt, yp)
+
+        metrics[[h_name]] <- rbind(
+          metrics[[h_name]],
+          data.frame(Fold = fold_idx, MAPE = m, RMSE = r, MAE = a)
+        )
+        cat("  ", sprintf("%-12s %9.3f%% %12.2f %12.2f", h_name, m, r, a), "\n")
+      }
+    }
+  }
+
+  # --- Ringkasan rata-rata antar fold ---
+  cat("\n", strrep("=", 65), "\n")
+  cat("  RINGKASAN RATA-RATA ANTAR FOLD -", toupper(komoditas), "\n")
+  cat("  ", sprintf("%-12s %10s %12s %12s", "Horizon","MAPE (%)","RMSE","MAE"), "\n")
+  cat("  ", strrep("-", 48), "\n")
+
+  ringkasan <- data.frame()
+  for (h_name in names(HORIZONS)) {
+    m <- metrics[[h_name]]
+    if (nrow(m) > 0) {
+      cat("  ", sprintf("%-12s %9.3f%% %12.2f %12.2f",
+                        h_name, round(mean(m$MAPE), 3),
+                        round(mean(m$RMSE), 2), round(mean(m$MAE), 2)), "\n")
+      ringkasan <- rbind(ringkasan, data.frame(
+        Horizon = h_name,
+        `MAPE (%)` = round(mean(m$MAPE), 3),
+        RMSE    = round(mean(m$RMSE), 2),
+        MAE     = round(mean(m$MAE),  2),
+        check.names = FALSE
+      ))
+    }
+  }
+  cat(strrep("=", 65), "\n")
+
+  return(list(
+    ringkasan        = ringkasan,
+    metrics          = metrics,
+    fold_results     = fold_results,
+    ordo_arima_fixed = ordo_arima,
+    ordo_garch_fixed = ordo_garch
+  ))
+}
+```
+
+# ============================================================
+# 8. JALANKAN UNTUK SEMUA KOMODITAS
+# ============================================================
+```{r}
+ordo_beras     <- tentukan_ordo(beras,     "Beras")
+ordo_ayam      <- tentukan_ordo(ayam,      "Ayam")
+ordo_bawangmerah <- tentukan_ordo(bawangmerah, "Bawang Merah")
+
+hasil_beras <- evaluasi_konsistensi(beras, ordo_beras$ordo_arima,
+                                    ordo_beras$ordo_garch, "Beras")
+hasil_ayam  <- evaluasi_konsistensi(ayam, ordo_ayam$ordo_arima,
+                                    ordo_ayam$ordo_garch, "Ayam")
+hasil_bawangmerah <- evaluasi_konsistensi(bawangmerah, ordo_bawangmerah$ordo_arima,
+                                        ordo_bawangmerah$ordo_garch, "Bawang Merah")
+```
+
+# ============================================================
+# 9. TABEL ORDO & RINGKASAN GABUNGAN SEMUA KOMODITAS
+# ============================================================
+```{r}
+tabel_ordo <- data.frame(
+  Komoditas   = c("Beras", "Ayam", "Bawang Merah"),
+  Model_ARIMA = c(
+    paste0("ARIMA(", paste(hasil_beras$ordo_arima_fixed, collapse=","), ")"),
+    paste0("ARIMA(", paste(hasil_ayam$ordo_arima_fixed,  collapse=","), ")"),
+    paste0("ARIMA(", paste(hasil_bawangmerah$ordo_arima_fixed, collapse=","), ")")
+  ),
+  Model_GARCH = c(
+    paste0("GARCH(", paste(hasil_beras$ordo_garch_fixed, collapse=","), ")"),
+    paste0("GARCH(", paste(hasil_ayam$ordo_garch_fixed,  collapse=","), ")"),
+    paste0("GARCH(", paste(hasil_bawangmerah$ordo_garch_fixed, collapse=","), ")")
+  )
+)
+print(tabel_ordo)
+
+ringkasan_all <- rbind(
+  cbind(Komoditas = "Beras",       hasil_beras$ringkasan),
+  cbind(Komoditas = "Ayam",        hasil_ayam$ringkasan),
+  cbind(Komoditas = "Bawang Merah", hasil_bawangmerah$ringkasan)
+)
+print(ringkasan_all)
+```
+# ============================================================
+#  UJI DIAGNOSTIK MODEL FINAL (REFIT PADA SELURUH DATA LATIH
+#     MENGGUNAKAN ORDO TERBAIK)
+# ============================================================
+```{r}
+LAGS_ARCH <- c(1, 7, 30, 60, 90)
+
+uji_arch_multi_lag <- function(residual, lags = LAGS_ARCH) {
+  hasil <- data.frame(Lag = integer(), Statistik = numeric(),
+                       P_Value = numeric(), Keterangan = character(),
+                       stringsAsFactors = FALSE)
+  for (lg in lags) {
+    tes <- tryCatch(ArchTest(residual, lags = lg), error = function(e) NULL)
+    if (!is.null(tes)) {
+      ket <- ifelse(tes$p.value < 0.05, "Terdapat efek ARCH", "Tidak ada efek ARCH")
+      hasil <- rbind(hasil, data.frame(
+        Lag = lg,
+        Statistik = round(as.numeric(tes$statistic), 4),
+        P_Value = round(tes$p.value, 4),
+        Keterangan = ket
+      ))
+    } else {
+      hasil <- rbind(hasil, data.frame(Lag = lg, Statistik = NA, P_Value = NA, Keterangan = "Uji gagal"))
+    }
+  }
+  return(hasil)
+}
+
+uji_diagnostik_model_final <- function(df, ordo_arima, ordo_garch,
+                                       komoditas = "Komoditas", lag_uji = 20) {
+
+  train_full <- df %>% filter(Tgl_Masuk >= "2023-01-01" & Tgl_Masuk <= "2024-12-31")
+  train_ts   <- ts(train_full$harga_rata)
+
+  # --- LANGKAH 1: ARCH-LM PRA-GARCH, MULTI-LAG (tabel terpisah) ---
+  arima_only_fit   <- Arima(train_ts, order = c(ordo_arima[1], ordo_arima[2], ordo_arima[3]))
+  resid_arima_only <- residuals(arima_only_fit)
+
+  arch_pra_multi <- uji_arch_multi_lag(resid_arima_only, lags = LAGS_ARCH)
+  arch_pra_multi$Komoditas <- komoditas
+
+  cat("\n  >> ARCH-LM PRA-GARCH (multi-lag) -", komoditas, ":\n")
+  print(arch_pra_multi, row.names = FALSE)
+
+  # --- LANGKAH 2: FIT MODEL HYBRID ARIMA-GARCH (sama seperti sebelumnya) ---
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = ordo_garch),
+    mean.model     = list(armaOrder = c(ordo_arima[1], ordo_arima[3]), include.mean = TRUE),
+    distribution.model = "norm"
+  )
+  hybrid_fit_final <- tryCatch(ugarchfit(spec = spec, data = train_ts, solver = "hybrid"), error = function(e) NULL)
+  if (is.null(hybrid_fit_final) || convergence(hybrid_fit_final) != 0) {
+    cat("  [!] Gagal fit model final -", komoditas, "\n")
+    return(list(diagnostik = data.frame(), arch_pra_multi = arch_pra_multi))
+  }
+
+  ic_final  <- tryCatch(infocriteria(hybrid_fit_final), error = function(e) NULL)
+  aic_final <- if (!is.null(ic_final)) round(ic_final[1], 4) else NA
+  bic_final <- if (!is.null(ic_final)) round(ic_final[2], 4) else NA
+
+  # --- LANGKAH 3: tabel diagnostik 4 uji (TANPA baris ARCH-LM Pra-GARCH lagi,
+  #     karena itu sudah punya tabel sendiri di arch_pra_multi) ---
+  std_resid <- as.numeric(residuals(hybrid_fit_final, standardize = TRUE))
+
+  lb_test        <- tryCatch(Box.test(std_resid,   lag = lag_uji, type = "Ljung-Box"), error = function(e) NULL)
+  lb_test_sq     <- tryCatch(Box.test(std_resid^2, lag = lag_uji, type = "Ljung-Box"), error = function(e) NULL)
+  arch_test_post <- tryCatch(ArchTest(std_resid, lags = lag_uji), error = function(e) NULL)
+  jb_test        <- tryCatch(jarque.bera.test(std_resid), error = function(e) NULL)
+
+  nama_model <- paste0("ARIMA(", paste(ordo_arima, collapse=","), ")-GARCH(", paste(ordo_garch, collapse=","), ")")
+
+  hasil <- data.frame(
+    Komoditas = komoditas,
+    Model     = nama_model,
+    Uji       = c("Ljung-Box (Sisaan)", "Ljung-Box (Sisaan Kuadrat)",
+                  "ARCH-LM (Pasca-GARCH)", "Jarque-Bera"),
+    Statistik_Uji = c(
+      if (!is.null(lb_test))        round(as.numeric(lb_test$statistic), 4)        else NA,
+      if (!is.null(lb_test_sq))     round(as.numeric(lb_test_sq$statistic), 4)     else NA,
+      if (!is.null(arch_test_post)) round(as.numeric(arch_test_post$statistic), 4) else NA,
+      if (!is.null(jb_test))        round(as.numeric(jb_test$statistic), 4)        else NA
+    ),
+    P_Value = c(
+      if (!is.null(lb_test))        round(lb_test$p.value, 4)        else NA,
+      if (!is.null(lb_test_sq))     round(lb_test_sq$p.value, 4)     else NA,
+      if (!is.null(arch_test_post)) round(arch_test_post$p.value, 4) else NA,
+      if (!is.null(jb_test))        round(jb_test$p.value, 4)        else NA
+    ),
+    Keterangan = c(
+      if (!is.null(lb_test)) ifelse(lb_test$p.value > 0.05, "Sisaan bebas (white noise)", "Sisaan tidak bebas") else "Uji gagal",
+      if (!is.null(lb_test_sq)) ifelse(lb_test_sq$p.value > 0.05, "Tidak ada sisa efek ARCH", "Masih terdapat efek ARCH") else "Uji gagal",
+      if (!is.null(arch_test_post)) ifelse(arch_test_post$p.value > 0.05, "Ragam homogen (efek ARCH tertangani)", "Masih terdapat heteroskedastisitas") else "Uji gagal",
+      if (!is.null(jb_test)) ifelse(jb_test$p.value > 0.05, "Sisaan menyebar normal", "Sisaan tidak menyebar normal") else "Uji gagal"
+    ),
+    AIC = c(aic_final, NA, NA, NA),
+    BIC = c(bic_final, NA, NA, NA)
+  )
+
+  return(list(diagnostik = hasil, arch_pra_multi = arch_pra_multi))
+}
+```
+
+```{r}
+diag_beras     <- uji_diagnostik_model_final(beras, hasil_beras$ordo_arima_fixed, hasil_beras$ordo_garch_fixed, "Beras")
+diag_ayam      <- uji_diagnostik_model_final(ayam, hasil_ayam$ordo_arima_fixed, hasil_ayam$ordo_garch_fixed, "Ayam")
+diag_bawangmerah <- uji_diagnostik_model_final(bawangmerah, hasil_bawangmerah$ordo_arima_fixed, hasil_bawangmerah$ordo_garch_fixed, "Bawang Merah")
+
+# Tabel 1: ARCH-LM pra-GARCH, multi-lag, semua komoditas
+arch_pra_multi_all <- rbind(diag_beras$arch_pra_multi, diag_ayam$arch_pra_multi, diag_bawangmerah$arch_pra_multi)
+print(arch_pra_multi_all, row.names = FALSE)
+
+# Tabel 2: 4 uji diagnostik pasca-GARCH, semua komoditas
+diagnostik_all <- rbind(diag_beras$diagnostik, diag_ayam$diagnostik, diag_bawangmerah$diagnostik)
+print(diagnostik_all, row.names = FALSE)
+
+write_xlsx(
+  list(ARCH_PraGARCH_MultiLag = arch_pra_multi_all,
+       Diagnostik_PascaGARCH  = diagnostik_all),
+  path = file.path(OUTPUT_DIR, "diagnostik_model_final_arima_garch.xlsx")
+)
+```
+
+
+
+
+# ============================================================
+# 10. PLOT EXPANDING WINDOW CV -- 1 PNG PER FOLD, PER KOMODITAS
+# ============================================================
+```{r, fig.width=11, fig.height=4}
+plot_cv_folds_per_fold <- function(fold_results, komoditas = "Komoditas",
+                                   output_dir = OUTPUT_DIR) {
+
+  if (length(fold_results) == 0) {
+    cat("Tidak ada fold untuk diplot -", komoditas, "\n")
+    return(invisible(NULL))
+  }
+
+  nama_folder      <- gsub(" ", "_", tolower(komoditas))
+  folder_komoditas <- file.path(output_dir, nama_folder)
+  dir.create(folder_komoditas, showWarnings = FALSE, recursive = TRUE)
+
+  file_paths <- c()
+
+  for (res in fold_results) {
+
+    fold_idx   <- res$fold
+    train_fold <- res$train_fold
+    val_fold   <- res$val_fold
+    y_actual   <- res$y_actual
+    y_pred     <- res$y_pred
+    n          <- length(y_actual)
+
+    train_n  <- nrow(train_fold)
+    x_train  <- seq_len(train_n)
+    x_val    <- seq(train_n + 1, train_n + n)
+
+    mape_val <- hitung_mape(y_actual, y_pred)
+    rmse_val <- hitung_rmse(y_actual, y_pred)
+    mae_val  <- hitung_mae(y_actual, y_pred)
+
+    fname <- file.path(folder_komoditas, paste0("fold_", fold_idx, ".png"))
+
+    png(fname, width = 11, height = 4, units = "in", res = 300)
+    par(mar = c(4, 4.5, 4, 1.5))
+
+    y_range <- range(c(train_fold$harga_rata, y_actual, y_pred), na.rm = TRUE)
+
+    plot(x_train, train_fold$harga_rata, type = "l", col = "#3B7DD8", lwd = 1,
+         xlim = c(1, train_n + n), ylim = y_range,
+         xlab = "Date Index (Hari)", ylab = "Harga (Rp)",
+         main = "")
+
+    # --- Highlight area validasi ---
+    rect(train_n + 1, y_range[1] - 1e6, train_n + n, y_range[2] + 1e6,
+         col = adjustcolor("#F5A623", alpha.f = 0.12), border = NA)
+
+    # --- Garis aktual & forecast validasi ---
+    lines(x_val, y_actual, col = "#2E9E4D", lwd = 1.3)
+    lines(x_val, y_pred,   col = "#E0902A", lwd = 1.3, lty = 2)
+    points(x_val, y_pred,  col = "#E0902A", pch = 16, cex = 0.4)
+
+    # --- Judul (gaya sejajar dengan LSTM) ---
+    train_start <- format(min(train_fold$Tgl_Masuk), "%b %Y")
+    train_end   <- format(max(train_fold$Tgl_Masuk), "%b %Y")
+    val_start   <- format(min(val_fold$Tgl_Masuk),   "%b %Y")
+    val_end     <- format(max(val_fold$Tgl_Masuk),   "%b %Y")
+
+    title(main = paste0("Fold ", fold_idx, " | Train: ", train_start, "-", train_end,
+                        " | Val: ", val_start, "-", val_end),
+          adj = 0, font.main = 2, cex.main = 1.0)
+
+    # --- Anotasi metrik pojok kanan atas ---
+    teks_metrik <- sprintf("MAPE: %.2f%%\nRMSE: %.2f\nMAE: %.2f",
+                           mape_val, rmse_val, mae_val)
+    legend("topright", legend = teks_metrik, bty = "o", bg = "white",
+           box.col = "#cccccc", cex = 0.75, text.font = 1, x.intersp = 0)
+
+    legend("topleft", legend = c("Train (Aktual)", "Actual Price (Val)", "Forecasted Price"),
+           col = c("#3B7DD8", "#2E9E4D", "#E0902A"), lty = c(1,1,2), lwd = 1.3,
+           bty = "n", cex = 0.75)
+
+    grid(lty = 3, col = "gray80")
+
+    dev.off()
+
+    file_paths <- c(file_paths, fname)
+    cat("  \u2713 Fold", fold_idx, "tersimpan ->", fname, "\n")
+  }
+
+  cat("\n\u2713 Total", length(file_paths), "gambar tersimpan di folder:", folder_komoditas, "\n")
+  return(file_paths)
+}
+
+plot_cv_folds_per_fold(hasil_beras$fold_results,     komoditas = "Beras")
+plot_cv_folds_per_fold(hasil_ayam$fold_results,      komoditas = "Ayam")
+plot_cv_folds_per_fold(hasil_bawangmerah$fold_results, komoditas = "Bawang Merah")
+```
+
+# ============================================================
+# 11. BOXPLOT DISTRIBUSI MAPE/RMSE/MAE PER HORIZON
+# ============================================================
+```{r, fig.width=14, fig.height=5}
+plot_boxplots <- function(metrics, komoditas = "Komoditas", output_dir = OUTPUT_DIR) {
+
+  horizons <- names(metrics)
+  configs  <- list(
+    list(key = "MAPE", label = "MAPE (%)",  col = "#5fbfa4"),
+    list(key = "RMSE", label = "RMSE (Rp)", col = "#f07f5a"),
+    list(key = "MAE",  label = "MAE (Rp)",  col = "#6fa8d6")
+  )
+
+  nama_folder      <- gsub(" ", "_", tolower(komoditas))
+  folder_komoditas <- file.path(output_dir, nama_folder)
+  dir.create(folder_komoditas, showWarnings = FALSE, recursive = TRUE)
+  fname <- file.path(folder_komoditas, "boxplot_metrik.png")
+
+  png(fname, width = 14, height = 5, units = "in", res = 300)
+  par(mfrow = c(1, 3), mar = c(5, 4.5, 4, 1.5))
+
+  for (cfg in configs) {
+    data_list <- lapply(horizons, function(h) metrics[[h]][[cfg$key]])
+    names(data_list) <- horizons
+
+    valid <- sapply(data_list, function(v) length(v) > 0 && any(is.finite(v)))
+    data_list <- data_list[valid]
+
+    if (length(data_list) == 0) {
+      cat("  [!] Tidak ada data valid untuk boxplot", cfg$label, "-", komoditas, "\n")
+      next
+    }
+
+    boxplot(data_list, col = cfg$col, border = "gray30",
+           main = cfg$label, xlab = "Horizon Prediksi", ylab = cfg$label,
+           cex.main = 1.1, cex.lab = 0.95)
+  }
+
+  mtext(paste("Distribusi Metrik Evaluasi ARIMA-GARCH -", komoditas),
+        outer = TRUE, line = -1.5, font = 2, cex = 1.1)
+
+  dev.off()
+  cat("\u2713 Boxplot tersimpan ->", fname, "\n")
+  return(fname)
+}
+
+plot_boxplots(hasil_beras$metrics,     komoditas = "Beras")
+plot_boxplots(hasil_ayam$metrics,      komoditas = "Ayam")
+plot_boxplots(hasil_bawangmerah$metrics, komoditas = "Bawang Merah")
+```
+
+# ============================================================
+# 12. SIMPAN AKTUAL VS PREDIKSI PER FOLD KE EXCEL
+# ============================================================
+```{r}
+simpan_aktual_prediksi <- function(fold_results, komoditas = "Komoditas",
+                                   output_dir = OUTPUT_DIR) {
+
+  if (length(fold_results) == 0) {
+    cat("Tidak ada data fold untuk disimpan -", komoditas, "\n")
+    return(invisible(NULL))
+  }
+
+  fname <- file.path(output_dir,
+                     paste0("aktual_prediksi_", tolower(gsub(" ", "_", komoditas)), ".xlsx"))
+
+  wb <- createWorkbook()
+  all_rows <- list()
+
+  for (res in fold_results) {
+
+    fold_idx <- res$fold
+    y_actual <- res$y_actual
+    y_pred   <- res$y_pred
+    n        <- length(y_actual)
+    tanggal  <- res$pred_dates[1:n]
+
+    mape <- hitung_mape(y_actual, y_pred)
+    rmse <- hitung_rmse(y_actual, y_pred)
+    mae  <- hitung_mae(y_actual, y_pred)
+
+    df_fold <- data.frame(
+      Tanggal       = tanggal,
+      `Aktual (Rp)` = round(y_actual, 2),
+      `Prediksi (Rp)` = round(y_pred, 2),
+      `Error (Rp)`  = round(y_actual - y_pred, 2),
+      `APE (%)`     = round(abs(y_actual - y_pred) /
+                            ifelse(y_actual != 0, y_actual, NA) * 100, 4),
+      check.names = FALSE
+    )
+
+    sheet_name <- paste0("Fold_", fold_idx)
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, df_fold, startRow = 1)
+
+    # --- Ringkasan metrik di bawah tabel utama (gaya sejajar LSTM) ---
+    start_row <- nrow(df_fold) + 3
+    writeData(wb, sheet_name, "Ringkasan Metrik", startRow = start_row, startCol = 1)
+    writeData(wb, sheet_name, data.frame(Metrik = c("MAPE (%)", "RMSE", "MAE"),
+                                         Nilai  = c(round(mape, 4), round(rmse, 2), round(mae, 2))),
+              startRow = start_row + 1, startCol = 1, colNames = FALSE)
+
+    cat("  \u2713 Fold", fold_idx, "tersimpan (", n, "baris, Val:",
+        format(min(tanggal), "%Y-%m-%d"), "s.d.", format(max(tanggal), "%Y-%m-%d"), ")\n")
+
+    df_temp <- data.frame(
+      Fold = fold_idx, Tanggal = tanggal,
+      `Aktual (Rp)` = round(y_actual, 2), `Prediksi (Rp)` = round(y_pred, 2),
+      `Error (Rp)` = round(y_actual - y_pred, 2),
+      `APE (%)` = round(abs(y_actual - y_pred) / ifelse(y_actual != 0, y_actual, NA) * 100, 4),
+      check.names = FALSE
+    )
+    all_rows[[length(all_rows) + 1]] <- df_temp
+  }
+
+  df_all <- do.call(rbind, all_rows)
+  addWorksheet(wb, "Semua_Fold")
+  writeData(wb, "Semua_Fold", df_all)
+  cat("  \u2713 Sheet gabungan 'Semua_Fold' tersimpan (", nrow(df_all), "total baris)\n")
+
+  saveWorkbook(wb, fname, overwrite = TRUE)
+  cat("\n\u2713 File tersimpan ->", fname, "\n")
+  return(fname)
+}
+
+simpan_aktual_prediksi(hasil_beras$fold_results,     komoditas = "Beras")
+simpan_aktual_prediksi(hasil_ayam$fold_results,      komoditas = "Ayam")
+simpan_aktual_prediksi(hasil_bawangmerah$fold_results, komoditas = "Bawang Merah")
+```
+
+# ============================================================
+# 13. SIMPAN SEMUA HASIL (DETAIL, RINGKASAN, ORDO) KE SATU EXCEL
+# ============================================================
+```{r}
+simpan_semua_hasil <- function(list_hasil, output_dir = OUTPUT_DIR) {
+
+  output_path <- file.path(output_dir, "hasil_expanding_window_cv_arima_garch.xlsx")
+
+  all_detail    <- data.frame()
+  all_ringkasan <- data.frame()
+  all_ordo      <- data.frame()
+
+  for (h in list_hasil) {
+
+    komoditas <- h$komoditas
+    metrics   <- h$metrics
+    ringkasan <- h$ringkasan
+
+    for (h_name in names(metrics)) {
+      m <- metrics[[h_name]]
+      if (nrow(m) > 0) {
+        all_detail <- rbind(all_detail, data.frame(
+          Komoditas = komoditas, Horizon = h_name, Fold = m$Fold,
+          `MAPE (%)` = round(m$MAPE, 4), RMSE = round(m$RMSE, 2), MAE = round(m$MAE, 2),
+          check.names = FALSE
+        ))
+      }
+    }
+
+    all_ringkasan <- rbind(all_ringkasan, cbind(Komoditas = komoditas, ringkasan))
+
+    all_ordo <- rbind(all_ordo, data.frame(
+      Komoditas = komoditas,
+      Model_ARIMA = paste0("ARIMA(", paste(h$ordo_arima, collapse=","), ")"),
+      Model_GARCH = paste0("GARCH(", paste(h$ordo_garch, collapse=","), ")")
+    ))
+  }
+
+  write_xlsx(
+    list(Detail_Fold = all_detail, Ringkasan = all_ringkasan, Ordo_Model = all_ordo),
+    path = output_path
+  )
+
+  cat("\n\u2713 Semua hasil tersimpan ->", output_path, "\n")
+  return(output_path)
+}
+
+list_hasil <- list(
+  list(komoditas = "Beras", metrics = hasil_beras$metrics, ringkasan = hasil_beras$ringkasan,
+       ordo_arima = hasil_beras$ordo_arima_fixed, ordo_garch = hasil_beras$ordo_garch_fixed),
+  list(komoditas = "Ayam", metrics = hasil_ayam$metrics, ringkasan = hasil_ayam$ringkasan,
+       ordo_arima = hasil_ayam$ordo_arima_fixed, ordo_garch = hasil_ayam$ordo_garch_fixed),
+  list(komoditas = "Bawang Merah", metrics = hasil_bawangmerah$metrics, ringkasan = hasil_bawangmerah$ringkasan,
+       ordo_arima = hasil_bawangmerah$ordo_arima_fixed, ordo_garch = hasil_bawangmerah$ordo_garch_fixed)
+)
+
+simpan_semua_hasil(list_hasil)
+```
+

@@ -1,0 +1,967 @@
+---
+title: "Pembangunan Model Hybrid ARIMA GARCH"
+author: "Siti Arbaynah"
+date: "2026-07-15"
+output:
+  html_document: default
+  word_document: default
+---
+
+
+```{r}
+# =========================================================
+# ANALISIS PEMBANGUNAN MODEL RATAAN (ARIMA)
+# =========================================================
+
+# Install package jika belum ada
+#install.packages(c("forecast", "tseries", "ggplot2", "gridExtra"))
+
+# Load package
+library(readxl)
+library(forecast)
+library(tseries)
+library(zoo)
+library(dplyr)
+library(rugarch)
+```
+# Input Data
+```{r}
+
+ayam <- read_excel("D:/SEMESTER 8/DATA/ayam_harian.xlsx")
+
+beras <- read_excel("D:/SEMESTER 8/DATA/beraspremium_harian.xlsx")
+
+bawangmerah <- read_excel("D:/SEMESTER 8/DATA/bawangmerah_harian (1).xlsx")
+
+```
+
+# UBAH FORMAT TANGGAL
+```{r}
+beras$Tgl_Masuk <- as.Date(beras$Tgl_Masuk)
+
+ayam$Tgl_Masuk <- as.Date(ayam$Tgl_Masuk)
+
+bawangmerah$Tgl_Masuk <- as.Date(bawangmerah$Tgl_Masuk)
+```
+```{r}
+library(tidyr)
+beras <- beras %>%
+  complete(
+    Tgl_Masuk = seq(
+      min(Tgl_Masuk),
+      max(Tgl_Masuk),
+      by = "day"
+    )
+  )
+
+ayam <- ayam %>%
+  complete(
+    Tgl_Masuk = seq(
+      min(Tgl_Masuk),
+      max(Tgl_Masuk),
+      by = "day"
+    )
+  )
+
+bawangmerah <- bawangmerah %>%
+  complete(
+    Tgl_Masuk = seq(
+      min(Tgl_Masuk),
+      max(Tgl_Masuk),
+      by = "day"
+    )
+  )
+```
+
+
+# MEMBENTUK ZOO TIME SERIES
+```{r}
+beras_series <- zoo(
+  beras$harga_rata,
+  order.by = beras$Tgl_Masuk
+)
+
+ayam_series <- zoo(
+  ayam$harga_rata,
+  order.by = ayam$Tgl_Masuk
+)
+
+bawangmerah_series <- zoo(
+  bawangmerah$harga_rata,
+  order.by = bawangmerah$Tgl_Masuk
+)
+```
+
+
+# IDENTIFIKASI DATA HILANG
+```{r}
+sum(is.na(beras$harga_rata))
+
+sum(is.na(ayam$harga_rata))
+
+sum(is.na(bawangmerah$harga_rata))
+
+```
+# INTERPOLASI LINEAR DATA HILANG na.approx() dari package zoo
+
+```{r}
+# BERAS
+beras$harga_rata <- na.approx(
+  beras$harga_rata,
+  na.rm = FALSE
+)
+
+beras$harga_rata <- na.locf(
+  beras$harga_rata,
+  na.rm = FALSE
+)
+
+beras$harga_rata <- na.locf(
+  beras$harga_rata,
+  fromLast = TRUE,
+  na.rm = FALSE
+)
+
+# AYAM
+ayam$harga_rata <- na.approx(
+  ayam$harga_rata,
+  na.rm = FALSE
+)
+
+ayam$harga_rata <- na.locf(
+  ayam$harga_rata,
+  na.rm = FALSE
+)
+
+ayam$harga_rata <- na.locf(
+  ayam$harga_rata,
+  fromLast = TRUE,
+  na.rm = FALSE
+)
+
+# Bawang Merah
+bawangmerah$harga_rata <- na.approx(
+  bawangmerah$harga_rata,
+  na.rm = FALSE
+)
+
+bawangmerah$harga_rata <- na.locf(
+  bawangmerah$harga_rata,
+  na.rm = FALSE
+)
+
+bawangmerah$harga_rata <- na.locf(
+  bawangmerah$harga_rata,
+  fromLast = TRUE,
+  na.rm = FALSE
+)
+
+
+
+```
+# CEK ULANG DATA HILANG
+
+```{r}
+sum(is.na(beras$harga_rata))
+
+sum(is.na(ayam$harga_rata))
+
+sum(is.na(bawangmerah$harga_rata))
+```
+
+
+# SPLIT TRAIN TEST
+```{r}
+# SPLIT TRAIN TEST - DATA UJI TAHUN 2025
+train_beras <- beras %>%
+  filter(Tgl_Masuk <= as.Date("2024-12-31"))
+test_beras <- beras %>%
+  filter(Tgl_Masuk >= as.Date("2025-01-01"))
+
+train_ayam <- ayam %>%
+  filter(Tgl_Masuk <= as.Date("2024-12-31"))
+test_ayam <- ayam %>%
+  filter(Tgl_Masuk >= as.Date("2025-01-01"))
+
+train_bawangmerah <- bawangmerah %>%
+  filter(Tgl_Masuk <= as.Date("2024-12-31"))
+test_bawangmerah <- bawangmerah %>%
+  filter(Tgl_Masuk >= as.Date("2025-01-01"))
+```
+
+```{r}
+# Pastikan jumlahnya masuk akal
+cat("Train Beras:", nrow(train_beras), "obs\n")
+cat("Test Beras:", nrow(test_beras), "obs\n")
+
+cat("Train Ayam:", nrow(train_ayam), "obs\n")
+cat("Test Ayam:", nrow(test_ayam), "obs\n")
+
+cat("Train Cabai:", nrow(train_bawangmerah), "obs\n")
+cat("Test Cabai:", nrow(test_bawangmerah), "obs\n")
+```
+
+
+# KONVERSI TRAIN MENJADI ts
+
+
+```{r}
+beras.ts <- ts(train_beras$harga_rata)
+
+ayam.ts <- ts(train_ayam$harga_rata)
+
+bawangmerah.ts <- ts(train_bawangmerah$harga_rata)
+
+```
+
+
+
+# PLOT ACF DATA AWAL
+```{r}
+par(mfrow = c(2,2))
+
+acf(beras.ts,
+    main = "ACF Harga Beras")
+
+acf(ayam.ts,
+    main = "ACF Harga Bawang Merah")
+
+acf(bawangmerah.ts,
+    main = "ACF Harga Bawang Merah")
+
+```
+# DIFFERENCING ORDO 1
+```{r}
+d_beras        <- diff(beras.ts, differences = 1)
+d_ayam  <- diff(ayam.ts, differences = 1)
+d_bawangmerah    <- diff(bawangmerah.ts, differences = 1)
+
+```
+# PLOT ACF SETELAH DIFFERENCING
+```{r}
+par(mfrow = c(2,2))
+
+acf(d_beras,
+    main = "ACF Differencing Beras")
+
+acf(d_ayam,
+    main = "ACF Differencing Ayam")
+
+acf(d_bawangmerah,
+    main = "ACF Differencing Bawang Merah")
+
+```
+# UJI STASIONERITAS ADF
+```{r}
+adf_beras <- adf.test(d_beras)
+
+adf_ayam <- adf.test(d_ayam)
+
+adf_bawangmerah <- adf.test(d_bawangmerah)
+
+hasil_adf <- data.frame(
+  Komoditas = c("Beras",
+                "Ayam",
+                "Bawang Merah"),
+
+  Statistik_ADF = c(adf_beras$statistic,
+                     adf_ayam$statistic,
+                     adf_bawangmerah$statistic),
+
+  P_Value = c(adf_beras$p.value,
+              adf_ayam$p.value,
+              adf_bawangmerah$p.value)
+)
+
+print(hasil_adf)
+
+```
+
+
+```{r}
+par(mfrow = c(2,2))
+
+Acf(d_beras,
+    main = "ACF Beras")
+
+Pacf(d_ayam,
+     main = "PACF Ayam")
+
+Acf(d_bawangmerah,
+    main = "ACF Cabe Merah")
+```
+
+# PEMILIHAN MODEL ARIMA TERBAIK DENGAN auto.arima()
+```{r}
+model_beras <- auto.arima(
+  beras.ts,
+  seasonal = FALSE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+model_ayam <- auto.arima(
+  ayam.ts,
+  seasonal = FALSE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+model_bawangmerah <- auto.arima(
+  bawangmerah.ts,
+  seasonal = FALSE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+```
+
+# MENAMPILKAN MODEL TERBAIK
+```{r}
+summary(model_beras)
+
+summary(model_ayam)
+
+summary(model_bawangmerah)
+```
+# RINGKASAN MODEL TERBAIK DAN AIC
+```{r}
+hasil_model <- data.frame(
+  Komoditas = c("Beras",
+                "Ayam",
+                "Bawang Merah"),
+
+  Model_ARIMA = c(
+    arimaorder(model_beras) |> paste(collapse = ","),
+    arimaorder(model_ayam) |> paste(collapse = ","),
+    arimaorder(model_bawangmerah) |> paste(collapse = ",")
+  ),
+
+  AIC = c(
+    AIC(model_beras),
+    AIC(model_ayam),
+    AIC(model_bawangmerah)
+  )
+)
+
+print(hasil_model)
+
+```
+# DIAGNOSTIK SISAAAN MODEL
+```{r}
+checkresiduals(model_beras)
+
+checkresiduals(model_ayam)
+
+checkresiduals(model_bawangmerah)
+
+
+```
+# UJI Ljung-Box SISAAAN
+```{r}
+Box.test(residuals(model_beras),
+         lag = 20,
+         type = "Ljung-Box")
+
+Box.test(residuals(model_ayam),
+         lag = 20,
+         type = "Ljung-Box")
+
+Box.test(residuals(model_bawangmerah),
+         lag = 20,
+         type = "Ljung-Box")
+```
+# 4.3
+
+# LOAD PACKAGE TAMBAHAN
+
+```{r}
+#install.packages(c("FinTS","rugarch"))
+
+library(FinTS)
+
+```
+# PEMBANGUNAN MODEL RAGAM
+```{r}
+res_beras <- residuals(model_beras)
+
+res_ayam <- residuals(model_ayam)
+
+res_bawangmerah <- residuals(model_bawangmerah)
+```
+# UJI LAGRANGE MULTIPLIER (ARCH TEST)
+```{r}
+lags <- c(7, 14, 21, 28, 35, 42)
+
+# =========================================================
+# FUNGSI UJI LM
+# =========================================================
+
+uji_lm <- function(residual, nama_komoditas){
+
+  hasil <- data.frame()
+
+  for(i in lags){
+
+    test <- ArchTest(
+      residual,
+      lags = i
+    )
+
+    hasil <- rbind(
+      hasil,
+      data.frame(
+        Komoditas = nama_komoditas,
+        Lag = i,
+        LM = as.numeric(test$statistic),
+        P_Value = test$p.value
+      )
+    )
+  }
+
+  return(hasil)
+}
+```
+# HASIL UJI LM
+```{r}
+lm_beras <- uji_lm(
+  res_beras,
+  "Beras"
+)
+
+lm_ayam <- uji_lm(
+  res_ayam,
+  "Ayam"
+)
+
+lm_bawangmerah <- uji_lm(
+  res_bawangmerah,
+  "Bawang Merah"
+)
+```
+# GABUNGKAN HASIL UJI LM
+```{r}
+hasil_lm <- rbind(
+  lm_beras,
+  lm_ayam,
+  lm_bawangmerah
+)
+
+print(hasil_lm)
+
+```
+# PEMILIHAN MODEL GARCH TERBAIK
+```{r}
+ #Mencoba kombinasi:
+# GARCH(1,0)
+# GARCH(1,1)
+# GARCH(1,2)
+# GARCH(2,1)
+# GARCH(2,2)
+# =========================================================
+
+# =========================================================
+# FUNGSI PEMILIHAN GARCH
+# =========================================================
+
+pilih_garch <- function(residual){
+
+  hasil <- data.frame()
+
+  for(p in 1:2){
+
+    for(q in 0:2){
+
+      # Skip model (0,0)
+      if(p == 0 & q == 0){
+        next
+      }
+
+      model <- tryCatch({
+
+        ugarchspec(
+          variance.model = list(
+            model = "sGARCH",
+            garchOrder = c(p,q)
+          ),
+
+          mean.model = list(
+            armaOrder = c(0,0),
+            include.mean = FALSE
+          ),
+
+          distribution.model = "norm"
+        )
+
+      }, error = function(e) NULL)
+
+      if(!is.null(model)){
+
+        fit <- tryCatch({
+
+          ugarchfit(
+            spec = model,
+            data = residual,
+            solver = "hybrid"
+          )
+
+        }, error = function(e) NULL)
+
+        if(!is.null(fit)){
+
+          hasil <- rbind(
+            hasil,
+            data.frame(
+              Model = paste0(
+                "GARCH(",
+                p,
+                ",",
+                q,
+                ")"
+              ),
+
+              AIC = infocriteria(fit)[1]
+            )
+          )
+        }
+      }
+    }
+  }
+
+  hasil <- hasil[order(hasil$AIC), ]
+
+  return(hasil)
+}
+
+```
+# PEMILIHAN MODEL GARCH
+```{r}
+garch_beras <- pilih_garch(res_beras)
+
+garch_ayam <- pilih_garch(res_ayam)
+
+garch_bawangmerah <- pilih_garch(res_bawangmerah)
+```
+# HASIL MODEL GARCH
+```{r}
+cat("=====================================\n")
+cat("MODEL GARCH BERAS\n")
+cat("=====================================\n")
+
+print(garch_beras)
+
+cat("\n\n")
+
+cat("=====================================\n")
+cat("MODEL GARCH AYAM\n")
+cat("=====================================\n")
+
+print(garch_ayam)
+
+cat("\n\n")
+
+cat("=====================================\n")
+cat("MODEL GARCH Bawang Merah\n")
+cat("=====================================\n")
+
+print(garch_bawangmerah)
+```
+# MEMILIH MODEL TERBAIK BERDASARKAN AIC TERKECIL
+```{r}
+best_beras <- garch_beras[1, ]
+
+best_ayam <- garch_ayam[1, ]
+
+best_bawangmerah <- garch_bawangmerah[1, ]
+```
+# TABEL RINGKASAN MODEL GARCH TERBAIK
+
+```{r}
+
+hasil_garch <- data.frame(
+  Komoditas = c(
+    "Beras",
+    "Ayam",
+    "Bawang Merah"
+  ),
+
+  Model_GARCH = c(
+    best_beras$Model,
+    best_ayam$Model,
+    best_bawangmerah$Model
+  ),
+
+  AIC = c(
+    best_beras$AIC,
+    best_ayam$AIC,
+    best_bawangmerah$AIC
+  )
+)
+
+print(hasil_garch)
+```
+
+# PEMBANGUNAN MODEL HYBRID ARIMA-GARCH
+```{r}
+
+hybrid_arima_garch <- function(data_ts, arima_model, garch_order, nama_komoditas){
+
+  # -----------------------------------
+  # Ambil ordo ARIMA
+  # -----------------------------------
+  order_arima <- arimaorder(arima_model)
+  p_arima <- order_arima[1]
+  d_arima <- order_arima[2]
+  q_arima <- order_arima[3]
+
+  data_asli <- data_ts
+  if (d_arima > 0) {
+    data_ts <- diff(data_ts, differences = d_arima)
+  }
+
+  # -----------------------------------
+  # Ambil ordo GARCH
+  # -----------------------------------
+  garch_order <- gsub("GARCH\\(", "", garch_order)
+  garch_order <- gsub("\\)", "", garch_order)
+  split_order <- strsplit(garch_order, ",")[[1]]
+  p_garch <- as.numeric(split_order[1])
+  q_garch <- as.numeric(split_order[2])
+
+  # -----------------------------------
+  # Spesifikasi & fitting model
+  # -----------------------------------
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(p_garch, q_garch)),
+    mean.model = list(armaOrder = c(p_arima, q_arima),
+                      include.mean = (d_arima == 0)),
+    distribution.model = "norm"
+  )
+
+  fit <- ugarchfit(spec = spec, data = data_ts, solver = "hybrid")
+
+  # -----------------------------------
+  # Ringkasan parameter
+  # -----------------------------------
+  coef_table <- fit@fit$matcoef
+  hasil <- data.frame(
+    Parameter = rownames(coef_table),
+    Dugaan = coef_table[,1],
+    Simpangan_Baku = coef_table[,2],
+    Nilai_t = coef_table[,3],
+    P_Value = coef_table[,4]
+  )
+
+  # -----------------------------------
+  # Output
+  # -----------------------------------
+  cat("\n========================================\n")
+  cat("MODEL HYBRID ARIMA-GARCH -", nama_komoditas, "\n")
+  cat("========================================\n")
+  print(hasil)
+  cat("\nModel Rataan:\n")
+  show(fit@model$modeldesc)
+  cat("\n")
+
+  # -----------------------------------
+  # SATU return() SAJA, di akhir fungsi
+  # -----------------------------------
+  return(list(
+    fit = fit,
+    tabel = hasil,
+    d_arima = d_arima,
+    data_asli = data_asli
+  ))
+}
+
+
+# =========================================================
+# MODEL HYBRID BERAS
+# =========================================================
+
+hybrid_beras <- hybrid_arima_garch(
+  data_ts = beras.ts,
+  arima_model = model_beras,
+  garch_order = best_beras$Model,
+  nama_komoditas = "BERAS"
+)
+
+# =========================================================
+# MODEL HYBRID AYAM
+# =========================================================
+
+hybrid_ayam <- hybrid_arima_garch(
+  data_ts = ayam.ts,
+  arima_model = model_ayam,
+  garch_order = best_ayam$Model,
+  nama_komoditas = "AYAM"
+)
+
+# =========================================================
+# MODEL HYBRID Bawang Merah
+# =========================================================
+
+hybrid_bawangmerah <- hybrid_arima_garch(
+  data_ts = bawangmerah.ts,
+  arima_model = model_bawangmerah,
+  garch_order = best_bawangmerah$Model,
+  nama_komoditas = "Bawang Merah"
+)
+
+
+
+
+```
+# RINGKASAN MODEL
+
+```{r}
+
+show(hybrid_beras$fit)
+
+show(hybrid_ayam$fit)
+
+show(hybrid_bawangmerah$fit)
+```
+```{r}
+# =========================================================
+# EKSTRAK NILAI AIC
+# =========================================================
+
+hasil_hybrid <- data.frame(
+  Komoditas = c(
+    "Beras",
+    "Ayam",
+    "Bawang Merah"
+  ),
+
+  Model = c(
+    paste0(
+      "ARIMA(",
+      paste(arimaorder(model_beras), collapse = ","),
+      ")-",
+      best_beras$Model
+    ),
+
+    paste0(
+      "ARIMA(",
+      paste(arimaorder(model_ayam), collapse = ","),
+      ")-",
+      best_ayam$Model
+    ),
+
+    paste0(
+      "ARIMA(",
+      paste(arimaorder(model_bawangmerah), collapse = ","),
+      ")-",
+      best_bawangmerah$Model
+    )
+  ),
+
+  AIC = c(
+    infocriteria(hybrid_beras$fit)[1],
+    infocriteria(hybrid_ayam$fit)[1],
+    infocriteria(hybrid_bawangmerah$fit)[1]
+  )
+)
+
+print(hasil_hybrid)
+```
+```{r}
+# ======================================================
+# FUNGSI EVALUASI
+# ======================================================
+
+rmse <- function(actual, predicted){
+  sqrt(mean((actual - predicted)^2))
+}
+
+mape <- function(actual, predicted){
+  mean(abs((actual - predicted)/actual))*100
+}
+
+mae <- function(actual, predicted){
+  mean(abs(actual - predicted))
+}
+```
+```{r}
+# ======================================================
+# FITTED VALUE
+# ======================================================
+
+fit_beras <- fitted(hybrid_beras$fit)
+
+fit_ayam <- fitted(hybrid_ayam$fit)
+
+fit_bawangmerah <- fitted(hybrid_bawangmerah$fit)
+```
+
+```{r}
+# =========================================================
+# REKONSTRUKSI FITTED VALUE KE SKALA LEVEL (untuk evaluasi_train)
+# =========================================================
+
+reconstruct_fitted_level <- function(hybrid_obj, actual_level){
+  d <- hybrid_obj$d_arima
+  fit_diff <- as.numeric(fitted(hybrid_obj$fit))
+
+  if (d == 0) {
+    return(list(fit_level = fit_diff, actual_aligned = actual_level))
+  }
+
+  n <- length(actual_level)
+  actual_lagged  <- actual_level[d:(n - 1)]       # Y_(t-1) aktual
+  fit_level      <- actual_lagged + fit_diff       # Y_hat_t = Y_(t-1) + W_hat_t
+  actual_aligned <- actual_level[(d + 1):n]        # Y_t yang sepadan
+
+  return(list(fit_level = fit_level, actual_aligned = actual_aligned))
+}
+
+rekon_beras        <- reconstruct_fitted_level(hybrid_beras, train_beras$harga_rata)
+rekon_ayam         <- reconstruct_fitted_level(hybrid_ayam, train_ayam$harga_rata)
+rekon_bawangmerah  <- reconstruct_fitted_level(hybrid_bawangmerah, train_bawangmerah$harga_rata)
+```
+
+```{r}
+# ======================================================
+# EVALUASI DATA LATIH
+# ======================================================
+
+evaluasi_train <- data.frame(
+  Komoditas = c("Beras", "Ayam", "Bawang Merah"),
+  Metode = "Hybrid ARIMA-GARCH",
+
+  RMSE = c(
+    rmse(rekon_beras$actual_aligned, rekon_beras$fit_level),
+    rmse(rekon_ayam$actual_aligned, rekon_ayam$fit_level),
+    rmse(rekon_bawangmerah$actual_aligned, rekon_bawangmerah$fit_level)
+  ),
+  MAPE = c(
+    mape(rekon_beras$actual_aligned, rekon_beras$fit_level),
+    mape(rekon_ayam$actual_aligned, rekon_ayam$fit_level),
+    mape(rekon_bawangmerah$actual_aligned, rekon_bawangmerah$fit_level)
+  ),
+  MAE = c(
+    mae(rekon_beras$actual_aligned, rekon_beras$fit_level),
+    mae(rekon_ayam$actual_aligned, rekon_ayam$fit_level),
+    mae(rekon_bawangmerah$actual_aligned, rekon_bawangmerah$fit_level)
+  )
+)
+
+print(evaluasi_train)
+```
+
+```{r}
+# ======================================================
+# JUMLAH PERIODE FORECAST
+# ======================================================
+
+n_beras <- nrow(test_beras)
+
+n_ayam <- nrow(test_ayam)
+
+n_bawangmerah <- nrow(test_bawangmerah)
+```
+# FORECAST
+```{r}
+fc_beras    <- ugarchforecast(hybrid_beras$fit, n.ahead = nrow(test_beras))
+diff_beras  <- as.numeric(fitted(fc_beras))
+last_beras  <- as.numeric(tail(hybrid_beras$data_asli, 1))   # ← tambahkan as.numeric() di sini
+pred_beras  <- last_beras + cumsum(diff_beras)
+
+fc_ayam     <- ugarchforecast(hybrid_ayam$fit, n.ahead = nrow(test_ayam))
+diff_ayam   <- as.numeric(fitted(fc_ayam))
+last_ayam   <- as.numeric(tail(hybrid_ayam$data_asli, 1))    # ← tambahkan di sini juga
+pred_ayam   <- last_ayam + cumsum(diff_ayam)
+
+fc_bawangmerah   <- ugarchforecast(hybrid_bawangmerah$fit, n.ahead = nrow(test_bawangmerah))
+diff_bawangmerah <- as.numeric(fitted(fc_bawangmerah))
+last_bawangmerah <- as.numeric(tail(hybrid_bawangmerah$data_asli, 1))   # ← dan di sini
+pred_bawangmerah <- last_bawangmerah + cumsum(diff_bawangmerah)
+```
+
+
+
+```{r}
+rmse <- function(actual, predicted){
+  sqrt(mean((actual - predicted)^2))
+}
+
+mape <- function(actual, predicted){
+  mean(abs((actual - predicted)/actual))*100
+}
+
+mae <- function(actual, predicted){
+  mean(abs(actual - predicted))
+}
+```
+
+```{r}
+evaluasi_test <- data.frame(
+
+  Komoditas = c(
+    "Beras",
+    "Ayam",
+    "Bawang Merah"
+  ),
+
+  RMSE = c(
+
+    rmse(
+      test_beras$harga_rata,
+      pred_beras
+    ),
+
+    rmse(
+      test_ayam$harga_rata,
+      pred_ayam
+    ),
+
+    rmse(
+      test_bawangmerah$harga_rata,
+      pred_bawangmerah
+    )
+  ),
+
+  MAPE = c(
+
+    mape(
+      test_beras$harga_rata,
+      pred_beras
+    ),
+
+    mape(
+      test_ayam$harga_rata,
+      pred_ayam
+    ),
+
+    mape(
+      test_bawangmerah$harga_rata,
+      pred_bawangmerah
+    )
+  ),
+
+  MAE = c(
+
+    mae(
+      test_beras$harga_rata,
+      pred_beras
+    ),
+
+    mae(
+      test_ayam$harga_rata,
+      pred_ayam
+    ),
+
+    mae(
+      test_bawangmerah$harga_rata,
+      pred_bawangmerah
+    )
+  )
+)
+
+print(evaluasi_test)
+```
+
+
+```
+
